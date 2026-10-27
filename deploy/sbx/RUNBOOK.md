@@ -340,9 +340,10 @@ never a timeout. No credential is involved.
   open tunnels end, new ones work at once. The same restart is needed after rebuilding the binary.
 - **Another install's `moca-egress.service`.** A host that also runs `deploy/microvm`'s P6 worker
   already has one. If `/etc/systemd/system/moca-egress.service` exists and `/etc/sbx/manifest` has no
-  `egress unit` line for it, `install-host.sh` logs `reusing the existing moca-egress.service (not
-  installed by this script)`, wires the workers to its socket and touches nothing else. Its allowlist
-  is then that install's `/etc/serverless-harness/moca-egress.env`.
+  `egress unit` line for it, `install-host.sh` logs
+  `reusing the existing moca-egress.service (not installed by this script)`, wires the workers to its
+  socket and touches nothing else. Its allowlist is then that install's
+  `/etc/serverless-harness/moca-egress.env`.
 - **`--no-egress`** installs a worker without `MOCA_EGRESS_CONTROL_SOCK` and installs no egress unit:
   the worker behaves as before egress existed, and the guest has no network.
 - **Snapshot:** a golden snapshot built before P4.1 has no guest egress listener. Rebuild it with
