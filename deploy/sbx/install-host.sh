@@ -2,20 +2,36 @@
 # deploy/sbx/install-host.sh -- install, update or remove one SBX0 template worker on a KVM host
 # (docs/specs/2026-10-15-sbx0-internal-sandbox-service-design.md §8.2).
 #
-#   sudo deploy/sbx/install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N]
+#   sudo deploy/sbx/install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress]
 #   sudo deploy/sbx/install-host.sh --uninstall WORKER_ID
 #   sudo deploy/sbx/install-host.sh --janitor JANITOR_BUNDLE_DIR
 #   sudo deploy/sbx/install-host.sh --uninstall-janitor
 #
 # BUNDLE_DIR is deploy/sbx/.generated/workers/<id> from deploy/sbx/setup.sh. IMAGE names a golden
 # snapshot under $SBX_SRV/snapshots (deploy/microvm/build-snapshot.sh --out $SBX_SRV/snapshots/IMAGE).
-# Needs microvm-worker, firecracker and jailer in /usr/local/bin (deploy/microvm/P4-ON-P6.md).
+# Needs microvm-worker, firecracker, jailer and moca-egress in /usr/local/bin (deploy/microvm/P4-ON-P6.md;
+# moca-egress: CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress).
+#
+# Guest egress (#623, P4.1): a worker install also installs and starts moca-egress, the host's
+# allowlisted egress proxy, before the worker, and wires the worker to its control socket
+# (MOCA_EGRESS_CONTROL_SOCK in the worker env). The rules:
+#   - One moca-egress per host serves every template worker.
+#   - It never clobbers a moca-egress.service this script did not install. A host that also runs
+#     deploy/microvm's P6 worker already has one; if $SBX_UNIT_DIR/moca-egress.service exists and the
+#     manifest has no `egress unit` line for it, it is reused: the workers are wired to its socket and
+#     nothing else is touched.
+#   - The binary is the operator's, like microvm-worker: a missing /usr/local/bin/moca-egress is
+#     refused before anything is written or systemd is touched.
+#   - $SBX_ENV_DIR/moca-egress.env (the allowlist; no secret, 0644) is written ONLY when absent,
+#     seeded from MOCA_EGRESS_ALLOW in the environment or else the GitHub hosts, so an operator's
+#     edit survives a re-run. Restart moca-egress by hand after editing it or rebuilding the binary.
+#   - --no-egress installs the worker without MOCA_EGRESS_CONTROL_SOCK and installs no egress unit.
 #
 # Touches ONLY its own files: the template unit, sbx.slice, sbx-<id>.slice, $SBX_ENV_DIR, and the
 # worker's directories under $SBX_SRV. Never another install on the same host. Every file it writes
 # is listed in $SBX_ENV_DIR/manifest, and --uninstall is the undo (spec §8.2): it removes the
 # worker's files and, once no worker is left in the manifest, the shared template unit and
-# sbx.slice too. It leaves workspace data in place (the janitor, or the operator, removes that).
+# sbx.slice and the moca-egress unit it installed (and its env file, unless the operator edited it). It leaves workspace data in place (the janitor, or the operator, removes that).
 #
 # --janitor takes deploy/sbx/.generated/janitor (janitor.env, janitor.token [+ api-ca.crt]) and
 # installs the host janitor (spec §8.3): $SBX_LIBEXEC_DIR/sbx-janitor.sh, $SBX_ENV_DIR/janitor.env
@@ -31,6 +47,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SBX_LIBEXEC_DIR:=/usr/local/libexec}"
 : "${SBX_ATTACH_TIMEOUT:=120}"
 : "${SBX_ATTACH_SETTLE:=5}"
+: "${SBX_BIN_DIR:=/usr/local/bin}"
+# moca-egress's control socket: the path inside the unit is fixed (RuntimeDirectory=moca-egress); the
+# override exists for tests only. The wait is as setup-microvm.sh's.
+: "${MOCA_EGRESS_SOCKET:=/run/moca-egress/control.sock}"
+: "${MOCA_EGRESS_READY_TIMEOUT:=30}"
+: "${DEFAULT_EGRESS_ALLOW:=api.github.com,github.com,codeload.github.com,objects.githubusercontent.com}"
 # A bundle from deploy/sbx/setup.sh carries SH_WORKSPACE_IDLE (the sandbox lifetime plus two days,
 # spec §5.4) and SH_WORKSPACE_IMAGE_MB. A bundle without the idle predates that rule and is refused;
 # the image size defaults to microvm-worker's own.
@@ -42,7 +64,7 @@ die() { echo "deploy/sbx/install-host.sh: $*" >&2; exit 1; }
 
 env_value() { (grep -E "^$1=" "$2" 2>/dev/null || true) | tail -1 | cut -d= -f2-; }
 
-BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' JANITOR='' UNINSTALL_JANITOR=''
+BUNDLE='' SNAPSHOT='' BUDGET_MB="$DEFAULT_BUDGET_MB" UNINSTALL='' JANITOR='' UNINSTALL_JANITOR='' NO_EGRESS=''
 parse_args() {
   while (($#)); do
     case "$1" in
@@ -51,6 +73,7 @@ parse_args() {
     --uninstall) [[ $# -ge 2 ]] || die '--uninstall needs a worker id'; UNINSTALL="$2"; shift 2 ;;
     --janitor) [[ $# -ge 2 ]] || die '--janitor needs the janitor bundle directory'; JANITOR="$2"; shift 2 ;;
     --uninstall-janitor) UNINSTALL_JANITOR=1; shift ;;
+    --no-egress) NO_EGRESS=1; shift ;;
     -*) die "unknown flag: $1" ;;
     *) [[ -z "$BUNDLE" ]] || die 'one bundle directory at a time'; BUNDLE="$1"; shift ;;
     esac
@@ -60,6 +83,64 @@ parse_args() {
 valid_id() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$1" != DIR ]]; }
 
 record() { mkdir -p "$SBX_ENV_DIR"; touch "$SBX_ENV_DIR/manifest"; grep -qxF "$1" "$SBX_ENV_DIR/manifest" || echo "$1" >>"$SBX_ENV_DIR/manifest"; }
+
+egress_seed() { printf 'MOCA_EGRESS_ALLOW=%s\n' "${MOCA_EGRESS_ALLOW:-$DEFAULT_EGRESS_ALLOW}"; }
+
+# wait_egress_ready: the worker's startup probe Registers over moca-egress's control socket, so a
+# moca-egress that exits at boot (a bad moca-egress.env) would otherwise surface much later, as the
+# worker failing to attach. The unit is Type=notify, so a successful start already means the socket is
+# bound; this wait is the belt to that, and it is what names moca-egress when it did not come up.
+wait_egress_ready() {
+  local deadline=$((SECONDS + MOCA_EGRESS_READY_TIMEOUT))
+  until [[ -S "$MOCA_EGRESS_SOCKET" ]]; do
+    if ((SECONDS >= deadline)); then
+      die "moca-egress did not bind $MOCA_EGRESS_SOCKET within ${MOCA_EGRESS_READY_TIMEOUT}s; the reason is in: journalctl -u moca-egress (often a bad $SBX_ENV_DIR/moca-egress.env). Fix it and re-run"
+    fi
+    sleep 1
+  done
+}
+
+# install_egress: see the header for the rules. Runs before install_units and before any systemctl.
+install_egress() {
+  local unit="$SBX_UNIT_DIR/moca-egress.service" env="$SBX_ENV_DIR/moca-egress.env" tmp changed=0 hint
+  [[ -x "$SBX_BIN_DIR/moca-egress" ]] ||
+    die "no $SBX_BIN_DIR/moca-egress: build it with CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress (or pass --no-egress to install the worker without guest egress)"
+  if [[ -e "$unit" ]] && ! grep -qxF "egress unit $unit" "$SBX_ENV_DIR/manifest" 2>/dev/null; then
+    log "reusing the existing moca-egress.service (not installed by this script)"
+    wait_egress_ready
+    return 0
+  fi
+  install -d -m 0755 "$SBX_UNIT_DIR"
+  install -d -m 0700 "$SBX_ENV_DIR"
+  # The unit is the P4 one with this host's env file and without its comments (they name the P6 paths).
+  tmp="$(mktemp)"
+  sed -e '/^#/d' -e "s#^EnvironmentFile=.*#EnvironmentFile=$env#" "$SCRIPT_DIR/../microvm/moca-egress.service" >"$tmp"
+  if ! cmp -s "$tmp" "$unit" 2>/dev/null; then
+    install -m 0644 "$tmp" "$unit"
+    changed=1
+  fi
+  rm -f "$tmp"
+  if [[ ! -e "$env" ]]; then
+    (umask 022 && egress_seed >"$env")
+    chmod 0644 "$env"
+    changed=1
+  fi
+  record "egress unit $unit"
+  record "egress file $env"
+  systemctl daemon-reload
+  systemctl enable moca-egress.service
+  # A Type=notify start that exits or times out before READY=1 -- a bad moca-egress.env -- makes
+  # systemctl itself fail, so it gets the same hint as a socket that never appears.
+  hint="the reason is in: journalctl -u moca-egress (often a bad $env). Fix it and re-run"
+  if ((changed)); then
+    systemctl reset-failed moca-egress.service || true
+    systemctl restart moca-egress.service || die "moca-egress failed to start; $hint"
+  elif ! systemctl is-active --quiet moca-egress.service; then
+    systemctl reset-failed moca-egress.service || true
+    systemctl start moca-egress.service || die "moca-egress failed to start; $hint"
+  fi
+  wait_egress_ready
+}
 
 install_units() {
   install -d -m 0755 "$SBX_UNIT_DIR"
@@ -71,8 +152,10 @@ install_units() {
   record "unit $SBX_UNIT_DIR/sbx-worker@.service"
 }
 
-install_worker() {
-  local env="$BUNDLE/worker.env" id addr tok idle image_mb ca=''
+# validate_worker reads and checks the bundle and the flags, setting W_ID, W_ADDR, W_TOK, W_IDLE and
+# W_IMAGE_MB. It writes nothing and touches no unit, so a refusal comes before install_egress starts one.
+validate_worker() {
+  local env="$BUNDLE/worker.env" id addr tok idle image_mb
   [[ -f "$env" ]] || die "no $env: pass the bundle directory deploy/sbx/setup.sh wrote (workers/<id>)"
   id="$(env_value SANDBOX_ID "$env")"
   valid_id "$id" || die "SANDBOX_ID in $env is not a valid worker id"
@@ -92,7 +175,11 @@ install_worker() {
   [[ "$SNAPSHOT" =~ ^[A-Za-z0-9._-]+$ ]] || die '--snapshot must be a directory name'
   [[ -d "$SBX_SRV/snapshots/$SNAPSHOT" ]] || die "no snapshot $SBX_SRV/snapshots/$SNAPSHOT (build it with deploy/microvm/build-snapshot.sh)"
   [[ "$BUDGET_MB" =~ ^[1-9][0-9]*$ ]] && ((BUDGET_MB > 1024)) || die '--budget-mb must be a whole number of MiB above 1024 (the unit reserve)'
+  W_ID="$id" W_ADDR="$addr" W_TOK="$tok" W_IDLE="$idle" W_IMAGE_MB="$image_mb"
+}
 
+install_worker() {
+  local id="$W_ID" addr="$W_ADDR" tok="$W_TOK" idle="$W_IDLE" image_mb="$W_IMAGE_MB" ca=''
   install -d -m 0700 "$SBX_ENV_DIR" "$SBX_ENV_DIR/workers"
   if [[ -f "$BUNDLE/relay-ca.crt" ]]; then
     grep -q -- '-----BEGIN CERTIFICATE-----' "$BUNDLE/relay-ca.crt" || die "$BUNDLE/relay-ca.crt holds no PEM certificate"
@@ -110,6 +197,7 @@ install_worker() {
       printf 'SH_WORKSPACE_ROOT=%s\nSH_CHROOT_BASE=%s\n' "$SBX_SRV/workspaces/$id" "$SBX_SRV/jail/$id"
       printf 'SH_PARENT_CGROUP=sbx.slice/sbx-%s.slice\n' "$id"
       printf 'SH_MAX_COMMITTED_MB=%s\nSH_WORKSPACE_IDLE=%s\nSH_WORKSPACE_IMAGE_MB=%s\n' "$BUDGET_MB" "$idle" "$image_mb"
+      [[ -n "$NO_EGRESS" ]] || printf 'MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock\n'
     } >"$SBX_ENV_DIR/workers/$id.env"
   )
   chmod 0600 "$SBX_ENV_DIR/workers/$id.env"
@@ -196,6 +284,31 @@ remove_shared_units() {
     drop_manifest_lines -x -e "unit $path"
     log "removed $path (no SBX0 worker left on this host)"
   done < <(grep '^unit ' "$SBX_ENV_DIR/manifest" || true)
+  remove_egress
+}
+
+# The moca-egress this script installed goes with the last worker: stopped, then its unit removed. Its
+# env file is the operator's allowlist, so an edited one stays (kept, and said so). A moca-egress.service
+# the manifest does not list was never ours and is not touched.
+remove_egress() {
+  local kind path
+  if grep -q '^egress unit ' "$SBX_ENV_DIR/manifest"; then
+    systemctl disable --now moca-egress.service || true
+  fi
+  while read -r kind path; do
+    case "$kind" in
+    unit) rm -f "$path"; log "removed $path (no SBX0 worker left on this host)" ;;
+    file)
+      if [[ -f "$path" && "$(cat "$path")" != "$(egress_seed)" ]]; then
+        log "kept $path (edited)"
+      else
+        rm -f "$path"
+        log "removed $path"
+      fi
+      ;;
+    esac
+    drop_manifest_lines -x -e "egress $kind $path"
+  done < <(sed -n 's/^egress //p' "$SBX_ENV_DIR/manifest")
 }
 
 # The janitor's paths go into sed replacements and a unit file: plain absolute paths only.
@@ -314,7 +427,11 @@ main() {
   # refused token's attached -> stream ended -> attached cycle could fall outside the window.
   [[ "$SBX_ATTACH_SETTLE" =~ ^[1-9][0-9]*$ ]] ||
     die "SBX_ATTACH_SETTLE='$SBX_ATTACH_SETTLE' must be a whole number of seconds, at least 1, to outlast the worker's first reconnect backoff (at most 750ms)"
-  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] | --uninstall ID | --janitor DIR | --uninstall-janitor'
+  [[ "$MOCA_EGRESS_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
+    die "MOCA_EGRESS_READY_TIMEOUT='$MOCA_EGRESS_READY_TIMEOUT' must be a whole number of seconds, at least 1"
+  [[ -n "$BUNDLE" ]] || die 'usage: install-host.sh BUNDLE_DIR --snapshot IMAGE [--budget-mb N] [--no-egress] | --uninstall ID | --janitor DIR | --uninstall-janitor'
+  validate_worker
+  [[ -n "$NO_EGRESS" ]] || install_egress
   install_units
   install_worker
 }

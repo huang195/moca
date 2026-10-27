@@ -128,7 +128,8 @@ Otherwise every janitor run logs `skipped`.
 ## 2. KVM host side
 
 The host needs what `deploy/microvm/P4-ON-P6.md` lists for P4 (`/dev/kvm`, Firecracker, jailer,
-`microvm-worker`) and outbound TCP 443 to the attach host. Build each template's snapshot under
+`microvm-worker`), `/usr/local/bin/moca-egress` (the install refuses without it, unless `--no-egress`)
+and outbound TCP 443 to the attach host. Build each template's snapshot under
 `/srv/sbx/snapshots/<image>` with `deploy/microvm/build-snapshot.sh`, then per worker:
 
     scp -r deploy/sbx/.generated/workers/<id> <host>:sbx-<id>
@@ -138,6 +139,8 @@ The host needs what `deploy/microvm/P4-ON-P6.md` lists for P4 (`/dev/kvm`, Firec
 The script waits up to `SBX_ATTACH_TIMEOUT` (120 s) for the worker's attach to hold. A newly added
 worker's token reaches the relay only when the kubelet syncs the Secret, about a minute, so the first
 attaches may be refused. Re-running it restarts the worker once, with the new env file.
+It also installs `moca-egress.service` (one per host, the guests' allowlisted egress proxy; allowlist
+in `/etc/sbx/moca-egress.env`) before the first worker: [the runbook](RUNBOOK.md#guest-egress).
 `install-host.sh --uninstall <id>` is the undo: it removes everything the install recorded in
 `/etc/sbx/manifest` for that worker (its unit instance, slice, env file and CA). The last uninstall on
 a host also removes the shared `sbx-worker@.service` and `sbx.slice`. Workspace data under

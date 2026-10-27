@@ -24,6 +24,10 @@ gitignored).
    `deploy/microvm/build-snapshot.sh --out /srv/sbx/snapshots/<image>`
    ([P4-ON-P6](../microvm/P4-ON-P6.md) has the full command). Every curated template carries `bash`,
    `git`, `tar` and `ripgrep`.
+   Build them with a `build-snapshot.sh` from P4.1 or later: an older snapshot has no guest egress
+   listener (see [Guest egress](#guest-egress)). The host also needs `/usr/local/bin/moca-egress`
+   (`CGO_ENABLED=0 go build -o /usr/local/bin/moca-egress ./remote-worker/cmd/moca-egress`); the
+   worker install refuses without it, unless you pass `--no-egress`.
 4. **The cluster side.** Write `<env file>` (README §1 lists every input; the required ones are
    `SBX_NAMESPACE`, `SBX_API_HOST`, `SBX_ATTACH_HOST`, `SBX_EXEC_HOST`, `SBX_IMAGE`, `SBX_WORKERS`,
    `SBX_TEMPLATES_FILE`, `SBX_GITHUB_CLIENT_ID`, `SBX_ALLOWED_SUBJECTS` and `SBX_WORKSPACE_FS_GIB`),
@@ -321,6 +325,33 @@ adds each command's first 200 bytes as `cmd`.
 - **Disk is not admission-controlled on the worker.** The quotas are the disk control: `setup.sh`
   refuses `SBX_MAX_TOTAL` × `SBX_WORKSPACE_IMAGE_MB` over 80 % of `SBX_WORKSPACE_FS_GIB`.
 
+## Guest egress
+
+`install-host.sh` installs and starts one `moca-egress` per host (`moca-egress.service`) before the
+worker, and wires every template worker to its control socket
+(`MOCA_EGRESS_CONTROL_SOCK=/run/moca-egress/control.sock` in the worker env). A sandbox can then reach
+only the hosts on the allowlist; everything else is refused with a named error (`destination_denied`),
+never a timeout. No credential is involved.
+
+- **The allowlist** is `MOCA_EGRESS_ALLOW` in `/etc/sbx/moca-egress.env`, a comma-separated list of
+  hosts. It is seeded on the first install with `api.github.com,github.com,codeload.github.com,objects.githubusercontent.com`
+  (or from `MOCA_EGRESS_ALLOW` in the installer's environment, on the first write only) and is never
+  overwritten by a re-run. To change it, edit the file and run `sudo systemctl restart moca-egress`;
+  open tunnels end, new ones work at once. The same restart is needed after rebuilding the binary.
+- **Another install's `moca-egress.service`.** A host that also runs `deploy/microvm`'s P6 worker
+  already has one. If `/etc/systemd/system/moca-egress.service` exists and `/etc/sbx/manifest` has no
+  `egress unit` line for it, `install-host.sh` logs `reusing the existing moca-egress.service (not
+  installed by this script)`, wires the workers to its socket and touches nothing else. Its allowlist
+  is then that install's `/etc/serverless-harness/moca-egress.env`.
+- **`--no-egress`** installs a worker without `MOCA_EGRESS_CONTROL_SOCK` and installs no egress unit:
+  the worker behaves as before egress existed, and the guest has no network.
+- **Snapshot:** a golden snapshot built before P4.1 has no guest egress listener. Rebuild it with
+  `build-snapshot.sh` for egress to work ([P4-ON-P6](../microvm/P4-ON-P6.md#guest-egress-p41-277)).
+- **If it fails to start,** the install names `journalctl -u moca-egress` (often a bad
+  `/etc/sbx/moca-egress.env`). Fix it and re-run `install-host.sh`.
+- **Uninstalling** the last worker also stops and removes the `moca-egress.service` this script
+  installed; an allowlist you edited stays (`kept ... (edited)`).
+
 ## 10. A KVM-host outage
 
 **What users see.** Every sandbox whose template runs on the host fails: `mocactl sbx run` and the
@@ -360,8 +391,8 @@ sudo <checkout>/deploy/sbx/install-host.sh --uninstall-janitor
 ```
 
 They remove exactly what the installs recorded in `/etc/sbx/manifest`; the last worker's uninstall
-also removes the shared `sbx-worker@.service` and `sbx.slice`. Workspace data under
-`/srv/sbx/workspaces/<id>` and `/srv/sbx/jail/<id>` is left; remove it by hand.
+also removes the shared `sbx-worker@.service` and `sbx.slice`, and the `moca-egress.service` it
+installed ([Guest egress](#guest-egress)). Workspace data under `/srv/sbx/workspaces/<id>` and `/srv/sbx/jail/<id>` is left; remove it by hand.
 
 In the cluster, delete what `setup.sh` applied, then its Secrets and ConfigMaps:
 
